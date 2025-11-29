@@ -1,561 +1,345 @@
-import pygame
-import sys
+#!/usr/bin/env python3
+# Swimming Simulator (Terminal Prototype)
+# Upgrades:
+# - Heavy anti-mash penalty: strokes faster than FAST_CADENCE_THRESHOLD push swimmer BACKWARDS briefly.
+# - Faster swimmer via SPEED_MULTIPLIER and tuned drag.
+# - Dynamic coaching tips under meters.
+# - Race time limit (configurable) with hard stop.
+# - Wide-screen pool (auto-fits terminal). Faster speed shows more movement.
+# - Constant glide (minimum forward velocity) for both players when not penalized.
+# - 2P HUD side-by-side to prevent scrolling.
 
-# Initialize Pygame
-pygame.init()
-pygame.font.init()  # Initialize the font module
+from __future__ import annotations
+import sys, time, threading, math, os
 
-# --- Constants ---
-SCREEN_WIDTH = 800
-SCREEN_HEIGHT = 600
-FPS = 60
+# ===== Config =====
+MAX_RACE_TIME = 60.0          # seconds; hard stop
+FAST_CADENCE_THRESHOLD = 0.25 # s between strokes considered too fast (anti-mash)
+PENALTY_BACKWARD_IMPULSE = 1.2 # m/s knocked off (can go negative)
+PENALTY_DURATION = 0.6        # seconds of penalty window (min-glide disabled)
+SPEED_MULTIPLIER = 1.35       # global multiplier to make swimmer faster
+BASE_DRAG_COEF = 0.75         # lower than before to sustain motion
+FRICTION = 0.30               # baseline velocity bleed
+MIN_GLIDE_SPEED = 0.22        # constant forward motion (m/s) when not penalized
+HUD_BAR_WIDTH = 28            # width of HUD bars
+POOL_LEFT_MARGIN = 2          # visual left margin in chars
 
-# Colors
-WHITE = (255, 255, 255)
-BLACK = (0, 0, 0)
-BLUE = (0, 0, 255)
-LIGHT_BLUE = (173, 216, 230)
-GREEN = (0, 255, 0)
-RED = (255, 0, 0)
-YELLOW = (255, 255, 0)
-PURPLE = (128, 0, 128)
-PINK = (255, 192, 203)
-GRAY = (128, 128, 128)
-BUTTON_COLOR = (100, 100, 200)
-BUTTON_HOVER_COLOR = (150, 150, 220)
-TEXT_COLOR = WHITE
+# ---------- Cross-platform nonblocking keyboard ----------
+if os.name == "nt":
+    import msvcrt  # type: ignore
+    class KeyReader:
+        def __init__(self): self.alive = True
+        def getch(self) -> str | None:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\x00","\xe0") and msvcrt.kbhit():
+                    _ = msvcrt.getwch()
+                    return None
+                return ch
+            return None
+        def cleanup(self): self.alive = False
+else:
+    import termios, tty, select
+    class KeyReader:
+        def __init__(self):
+            self.fd = sys.stdin.fileno()
+            self.old = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd); self.alive = True
+        def getch(self) -> str | None:
+            r,_,_ = select.select([sys.stdin],[],[],0)
+            if r:
+                ch = os.read(self.fd, 4).decode(errors="ignore")
+                return ch[0] if ch else None
+            return None
+        def cleanup(self):
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old); self.alive = False
 
-# Fonts
-DEFAULT_FONT_SIZE = 30
-LARGE_FONT_SIZE = 50
-SMALL_FONT_SIZE = 20
-try:
-    DEFAULT_FONT = pygame.font.SysFont("Arial", DEFAULT_FONT_SIZE)
-    LARGE_FONT = pygame.font.SysFont("Arial", LARGE_FONT_SIZE)
-    SMALL_FONT = pygame.font.SysFont("Arial", SMALL_FONT_SIZE)
-except pygame.error:
-    DEFAULT_FONT = pygame.font.Font(None, DEFAULT_FONT_SIZE)  # Fallback font
-    LARGE_FONT = pygame.font.Font(None, LARGE_FONT_SIZE)
-    SMALL_FONT = pygame.font.Font(None, SMALL_FONT_SIZE)
+# ---------- ANSI helpers ----------
+CSI = "\x1b["; HIDE = CSI+"?25l"; SHOW = CSI+"?25h"; CLS = CSI+"2J"; HOME = CSI+"H"
 
-# Game States
-STATE_MAIN_MENU = "main_menu"
-STATE_PLAYER_SELECT = "player_select"
-STATE_PLAYER_SETUP = "player_setup"
-STATE_SHOP = "shop"
-STATE_RACE = "race"
-STATE_RACE_END = "race_end"
+def move(y: int, x: int) -> str: return f"{CSI}{y};{x}H"
 
-# Player Configuration
-# Easily change key bindings here
-# Each player dict: 'move' = key for swimming, 'exit' = key for exiting water (finishing)
-PLAYER_CONTROLS_CONFIG = [
-    {'name': 'Player 1', 'move': pygame.K_p, 'exit': pygame.K_v, 'color': RED},
-    {'name': 'Player 2', 'move': pygame.K_j, 'exit': pygame.K_n, 'color': GREEN},
-    {'name': 'Player 3', 'move': pygame.K_f, 'exit': pygame.K_w, 'color': YELLOW},
-    {'name': 'Player 4', 'move': pygame.K_q, 'exit': pygame.K_o, 'color': PURPLE},
-]
+def clear_to_eol() -> str: return CSI+"K"
 
-# Shop Items
-# Structure: { "id": {"name": "Item Name", "price": 0, "type": "flipper/goggles/snack/swimsuit", "effect_value": 0, "tier": 0 (0=basic, 1=better, 2=best)}}
-# Effect value: speed boost for flippers/goggles, duration/intensity for snacks
-SHOP_ITEMS = {
-    "flipper_basic": {"name": "Basic Flippers", "price": 30, "type": "flipper", "effect_value": 0.1, "tier": 0},
-    "flipper_pro": {"name": "Pro Flippers", "price": 60, "type": "flipper", "effect_value": 0.2, "tier": 1},
-    "goggles_basic": {"name": "Basic Goggles", "price": 15, "type": "goggles", "effect_value": 0.05, "tier": 0},
-    "goggles_good": {"name": "Good Goggles", "price": 30, "type": "goggles", "effect_value": 0.1, "tier": 1},
-    "goggles_best": {"name": "Best Goggles", "price": 50, "type": "goggles", "effect_value": 0.15, "tier": 2},
-    # Best goggles
-    "snack_small": {"name": "Small Snack", "price": 10, "type": "snack", "effect_value": 5, "tier": 0},
-    # 5 seconds boost
-    "snack_medium": {"name": "Medium Snack", "price": 20, "type": "snack", "effect_value": 10, "tier": 1},
-    "snack_large": {"name": "Large Snack", "price": 30, "type": "snack", "effect_value": 15, "tier": 2},  # Best snack
-    "swimsuit_red": {"name": "Red Swimsuit", "price": 5, "type": "swimsuit", "color_value": RED, "tier": 0},
-    "swimsuit_blue": {"name": "Blue Swimsuit", "price": 5, "type": "swimsuit", "color_value": BLUE, "tier": 0},
-    "swimsuit_yellow": {"name": "Yellow Swimsuit", "price": 5, "type": "swimsuit", "color_value": YELLOW, "tier": 0},
-    "swimsuit_green": {"name": "Green Swimsuit", "price": 5, "type": "swimsuit", "color_value": GREEN, "tier": 0},
-    "swimsuit_purple": {"name": "Purple Swimsuit", "price": 5, "type": "swimsuit", "color_value": PURPLE, "tier": 0},
-    "swimsuit_pink": {"name": "Pink Swimsuit", "price": 5, "type": "swimsuit", "color_value": PINK, "tier": 0},
-    "swimsuit_black": {"name": "Black Swimsuit", "price": 5, "type": "swimsuit", "color_value": BLACK, "tier": 0},
-}
+# ---------- Double-buffered screen ----------
+class Screen:
+    def __init__(self, width: int, height: int):
+        self.w,self.h = width,height
+        self.front = [""]*height
+        self.back  = [" "*width for _ in range(height)]
+    def draw_line(self, y: int, s: str):
+        if 0 <= y < self.h:
+            txt = s
+            if len(txt) < self.w: txt += " "*(self.w-len(txt))
+            else: txt = txt[:self.w]
+            self.back[y] = txt
+    def clear(self): self.back = [" "*self.w for _ in range(self.h)]
+    def flush(self):
+        out=[]
+        for y in range(self.h):
+            if self.back[y] != self.front[y]:
+                out.append(move(y+1,1)+self.back[y]+clear_to_eol())
+        if out:
+            sys.stdout.write("".join(out)); sys.stdout.flush(); self.front[:] = self.back[:]
 
-# Race Configuration
-RACE_LENGTH = SCREEN_WIDTH - 100  # Pixels to cover
-LANE_HEIGHT = 100
-LANE_PADDING = 10
-START_X = 50
-FINISH_LINE_X = START_X + RACE_LENGTH
+# ---------- Game data ----------
+def clamp(v,a,b): return a if v<a else b if v>b else v
 
-# --- Global Variables ---
-screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("Swimming Race Mania")
-clock = pygame.time.Clock()
-current_state = STATE_MAIN_MENU
-num_players_selected = 0
-players_data = []  # List to store Player objects
-active_input_player_index = 0  # For name input
-input_text = ""
-shop_current_player_idx = 0  # Which player is currently shopping
-race_winner = None
-
-
-# --- Helper Functions ---
-def draw_text(text, font, color, surface, x, y, center=False):
-    textobj = font.render(text, True, color)
-    textrect = textobj.get_rect()
-    if center:
-        textrect.center = (x, y)
-    else:
-        textrect.topleft = (x, y)
-    surface.blit(textobj, textrect)
-    return textrect
-
-
-def create_button(text, rect_pos_size, base_color, hover_color, font, action=None):
-    mouse_pos = pygame.mouse.get_pos()
-    clicked = pygame.mouse.get_pressed()[0] == 1  # Left click
-
-    rect = pygame.Rect(rect_pos_size)
-
-    if rect.collidepoint(mouse_pos):
-        pygame.draw.rect(screen, hover_color, rect, border_radius=10)
-        if clicked and action:
-            pygame.time.wait(200)  # Debounce click
-            return action()  # Call the action function
-    else:
-        pygame.draw.rect(screen, base_color, rect, border_radius=10)
-
-    draw_text(text, font, TEXT_COLOR, screen, rect.centerx, rect.centery, center=True)
-    return None  # No action triggered or no action defined
-
-
-# --- Player Class ---
 class Player:
-    def __init__(self, player_id, name, controls, color, start_coins=50):
-        self.id = player_id
-        self.name = name
-        self.controls = controls  # {'move': key, 'exit': key}
-        self.color = color
-        self.coins = start_coins
-        self.gear = {  # Item IDs from SHOP_ITEMS
-            "flipper": None,
-            "goggles": None,
-            "snack": None,  # Snacks are consumed per race
-            "swimsuit": None
-        }
-        self.x = START_X
-        self.y = 0  # Will be set based on lane
-        self.base_speed = 2  # Pixels per frame
-        self.current_speed = self.base_speed
-        self.snack_active_time = 0  # Countdown for snack effect
-        self.finished_race = False
-        self.finish_time = 0
-
-    def update_speed(self):
-        self.current_speed = self.base_speed
-        if self.gear["flipper"]:
-            self.current_speed += SHOP_ITEMS[self.gear["flipper"]]["effect_value"] * 10  # Scale effect
-        if self.gear["goggles"]:
-            self.current_speed += SHOP_ITEMS[self.gear["goggles"]]["effect_value"] * 10  # Scale effect
-
-        if self.snack_active_time > 0:
-            if self.gear["snack"]:  # Assuming snack gives a temporary flat boost
-                self.current_speed += SHOP_ITEMS[self.gear["snack"]]["effect_value"] * 0.2  # Smaller, temporary boost
-            self.snack_active_time -= 1 / FPS
-            if self.snack_active_time <= 0:
-                self.gear["snack"] = None  # Consume snack
-
-    def move(self):
-        if not self.finished_race:
-            self.x += self.current_speed
-            if self.x >= FINISH_LINE_X:
-                self.x = FINISH_LINE_X
-                self.finished_race = True
-                # Record finish time (simple frame count for now)
-                self.finish_time = pygame.time.get_ticks()
-
-    def draw(self, surface, lane_y):
-        self.y = lane_y + LANE_HEIGHT // 2
-        player_rect = pygame.Rect(self.x - 15, self.y - 10, 30, 20)  # Simple rectangle for player
-
-        player_color = self.color
-        if self.gear["swimsuit"] and SHOP_ITEMS[self.gear["swimsuit"]]["type"] == "swimsuit":
-            player_color = SHOP_ITEMS[self.gear["swimsuit"]]["color_value"]
-
-        pygame.draw.rect(surface, player_color, player_rect, border_radius=5)
-        draw_text(self.name[0], SMALL_FONT, BLACK, surface, self.x, self.y - 25, center=True)  # Initial
-
-    def buy_item(self, item_id):
-        item = SHOP_ITEMS[item_id]
-        if self.coins >= item["price"]:
-            # Constraint: Cannot have best goggles and best snack at the same time
-            if item["type"] == "goggles" and item["tier"] == 2:  # Trying to buy best goggles
-                if self.gear["snack"] and SHOP_ITEMS[self.gear["snack"]]["tier"] == 2:
-                    print(f"{self.name} cannot buy best goggles with best snack equipped.")
-                    return False  # Purchase failed
-            if item["type"] == "snack" and item["tier"] == 2:  # Trying to buy best snack
-                if self.gear["goggles"] and SHOP_ITEMS[self.gear["goggles"]]["tier"] == 2:
-                    print(f"{self.name} cannot buy best snack with best goggles equipped.")
-                    return False  # Purchase failed
-
-            self.coins -= item["price"]
-            if item["type"] in self.gear:  # flipper, goggles, swimsuit
-                self.gear[item["type"]] = item_id
-            elif item["type"] == "snack":  # Snacks are equipped for next race
-                self.gear["snack"] = item_id  # Overwrite previous snack if any
-            print(f"{self.name} bought {item['name']}. Coins left: {self.coins}")
-            return True
+    def __init__(self, name: str, keys: dict[str,str], lane_y: int, pool_len_m=25.0):
+        self.name=name; self.keys=keys; self.lane_y=lane_y; self.pool_len=pool_len_m
+        self.pos=0.0; self.v=0.0; self.o2=1.0; self.sta=1.0; self.fatigue=0.0
+        self.last_stroke=None; self.stroke_time=0.0; self.stroke_count=0
+        self.breath_cooldown=0.0; self.finished=False; self.finish_time=None
+        self.penalty_timer=0.0
+    def handle_key(self, ch: str, t: float):
+        if ch == self.keys.get("left"):  self._stroke('L', t)
+        elif ch == self.keys.get("right"): self._stroke('R', t)
+        elif ch == self.keys.get("kick"):  self._kick()
+        elif ch == self.keys.get("breathe"): self._breathe()
+    def _stroke(self, side: str, now: float):
+        # Anti-mash check
+        fast = False
+        if self.stroke_time>0 and (now - self.stroke_time) < FAST_CADENCE_THRESHOLD:
+            fast = True
+        # Rhythm efficiency around ~0.47s
+        eff=0.8
+        if self.stroke_time>0:
+            dt=now-self.stroke_time; target=0.47
+            eff=math.exp(-((dt-target)**2)/(2*0.08**2))
+        alt_bonus = 1.0 if (self.last_stroke and self.last_stroke!=side) else 0.6
+        thrust = SPEED_MULTIPLIER * 1.9 * eff * alt_bonus * (0.6+0.4*self.sta) * (0.6+0.4*self.o2) * (1.0-0.5*self.fatigue)
+        if fast:
+            # Apply backward impulse and start penalty window
+            self.v -= PENALTY_BACKWARD_IMPULSE
+            self.penalty_timer = max(self.penalty_timer, PENALTY_DURATION)
         else:
-            print(f"{self.name} has not enough coins for {item['name']}.")
-            return False
+            self.v += thrust * 0.28
+        self.stroke_time=now; self.last_stroke=side; self.stroke_count+=1
+        # Costs
+        self.sta = clamp(self.sta - 0.04, 0.0, 1.0)
+        self.o2  = clamp(self.o2  - 0.012, 0.0, 1.0)
+        self.fatigue = clamp(self.fatigue + (0.03 if fast else 0.018), 0.0, 1.0)
+    def _kick(self):
+        self.v += SPEED_MULTIPLIER * 0.28 * (0.5+0.5*self.sta)
+        self.sta = clamp(self.sta - 0.015, 0.0, 1.0)
+        self.fatigue = clamp(self.fatigue + 0.01, 0.0, 1.0)
+    def _breathe(self):
+        if self.breath_cooldown<=0.0:
+            self.o2 = clamp(self.o2 + 0.38, 0.0, 1.0)
+            self.breath_cooldown = 0.8
+    def update(self, dt: float):
+        # Recovery & decay
+        self.sta = clamp(self.sta + dt*0.075*(0.7 if self.v>0.9 else 1.0), 0.0, 1.0)
+        self.o2  = clamp(self.o2 - dt*0.028*(1.15 if self.v>1.3 else 1.0), 0.0, 1.0)
+        self.fatigue = clamp(self.fatigue - dt*0.05, 0.0, 1.0)
+        if self.breath_cooldown>0: self.breath_cooldown -= dt
+        if self.penalty_timer>0: self.penalty_timer -= dt
+        # Drag & friction
+        drag_coef = BASE_DRAG_COEF * (1.5 if self.o2<0.15 else 1.0)
+        if self.breath_cooldown>0.6: drag_coef *= 1.15
+        # Glide bonus when not stroking very recently
+        glide=0.9
+        if self.stroke_time>0 and (time.perf_counter()-self.stroke_time) > 0.35:
+            glide=0.8
+        drag = drag_coef * (self.v**2) * dt * glide
+        self.v -= drag + FRICTION*dt
+        # Constant glide (unless penalized)
+        if self.penalty_timer <= 0:
+            if self.v < MIN_GLIDE_SPEED:
+                self.v = MIN_GLIDE_SPEED
+        # Update position, allow slight backward but not beyond wall 0
+        self.pos += self.v * dt
+        if self.pos < 0: self.pos = 0.0
+        if self.pos >= self.pool_len and not self.finished:
+            self.finished=True
 
-    def use_snack(self):
-        if self.gear["snack"] and not self.snack_active_time > 0:  # Can only use if not already active
-            self.snack_active_time = SHOP_ITEMS[self.gear["snack"]]["effect_value"]  # Duration in seconds
-            print(f"{self.name} used {SHOP_ITEMS[self.gear['snack']]['name']}")
-            # Snack is consumed after its effect wears off (handled in update_speed)
+# ---------- Input thread ----------
+class InputThread:
+    def __init__(self, keyreader: KeyReader):
+        self.reader=keyreader; self.q=[]; self.lock=threading.Lock()
+        self.t=threading.Thread(target=self.run, daemon=True); self.alive=True; self.t.start()
+    def run(self):
+        while self.alive and self.reader.alive:
+            ch=self.reader.getch()
+            if ch:
+                with self.lock: self.q.append(ch.lower())
+            time.sleep(0.001)
+    def pop_all(self):
+        with self.lock: items=self.q[:]; self.q.clear(); return items
+    def stop(self): self.alive=False
 
+# ---------- HUD / Coaching ----------
 
-# --- Game State Functions ---
-def main_menu():
-    global current_state, num_players_selected, players_data
-    screen.fill(LIGHT_BLUE)
-    draw_text("Swimming Race Mania!", LARGE_FONT, BLACK, screen, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 4, center=True)
+def bar(label: str, value: float, width: int, emoji: str) -> str:
+    v=clamp(value,0.0,1.0); filled=int(round(v*width)); empty=width-filled
+    return f"{emoji} {label}: " + "█"*filled + "░"*empty + f" {int(v*100):3d}%"
 
-    if create_button("Start Game", (SCREEN_WIDTH // 2 - 100, SCREEN_HEIGHT // 2 - 50, 200, 50), BUTTON_COLOR,
-                     BUTTON_HOVER_COLOR, DEFAULT_FONT, lambda: STATE_PLAYER_SELECT):
-        current_state = STATE_PLAYER_SELECT
-        return  # Exit to avoid processing other buttons in same frame
+def speed_bar(spd: float, max_spd: float, width: int, emoji: str) -> str:
+    v=clamp(spd/max_spd,0.0,1.0); filled=int(round(v*width)); empty=width-filled
+    return f"{emoji} Speed: " + "█"*filled + "░"*empty + f" {spd:4.2f} m/s"
 
-    if create_button("Shop", (SCREEN_WIDTH // 2 - 100, SCREEN_HEIGHT // 2 + 20, 200, 50), BUTTON_COLOR,
-                     BUTTON_HOVER_COLOR, DEFAULT_FONT, lambda: STATE_SHOP if players_data else None):
-        if players_data:  # Can only go to shop if players exist
-            current_state = STATE_SHOP
-            global shop_current_player_idx
-            shop_current_player_idx = 0  # Reset to first player for shopping
-        else:
-            # Optionally, display a message "Set up players first"
-            print("Please set up players before visiting the shop.")
-        return
+def coaching(p: Player, now: float) -> str:
+    tips=[]
+    # Cadence advice
+    if p.stroke_time>0:
+        dt = now - p.stroke_time
+        if dt < FAST_CADENCE_THRESHOLD:
+            tips.append("Too fast: pause 0.3–0.5s")
+        elif dt > 0.9:
+            tips.append("Stroke now: A/D rhythm")
+    # Resources
+    if p.o2 < 0.35: tips.append("Breathe (W)")
+    if p.sta < 0.35: tips.append("Glide 1s to recover")
+    if p.fatigue > 0.6: tips.append("Slow cadence")
+    if p.penalty_timer>0: tips.append("Penalty: stop mashing")
+    if not tips: tips = ["Alternate A-D, breathe every 3–5 strokes"]
+    # Join with bullets
+    return " • ".join(tips)[:max(20, HUD_BAR_WIDTH*2+10)]
 
-    if create_button("Quit", (SCREEN_WIDTH // 2 - 100, SCREEN_HEIGHT // 2 + 90, 200, 50), BUTTON_COLOR,
-                     BUTTON_HOVER_COLOR, DEFAULT_FONT, pygame.quit):
-        pygame.quit()
-        sys.exit()
+# ---------- Overlay helper ----------
+class Overlay:
+    @staticmethod
+    def put(screen: Screen, y: int, x: int, s: str):
+        if not (0 <= y < screen.h) or x >= screen.w: return
+        base = screen.back[y]
+        if len(base) < screen.w: base += " "*(screen.w-len(base))
+        s = s[: max(0, screen.w - x)]
+        screen.back[y] = base[:x] + s + base[x+len(s):]
 
+# ---------- Rendering ----------
 
-def player_select_screen():
-    global current_state, num_players_selected
-    screen.fill(LIGHT_BLUE)
-    draw_text("Select Number of Players", LARGE_FONT, BLACK, screen, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 4, center=True)
+def render_pool(screen: Screen, players: list[Player], t0: float, header: str, now: float):
+    screen.clear(); W,H = screen.w, screen.h
+    screen.draw_line(0, header[:W])
 
-    button_y_start = SCREEN_HEIGHT // 2 - 60
-    button_height = 50
-    button_spacing = 10
+    left = POOL_LEFT_MARGIN
+    pool_chars = max(20, W - left - 2)  # wide screen auto-fit
+    right = left + pool_chars
+    meters_to_cols = pool_chars / max(1.0, max(p.pool_len for p in players))
 
-    def set_players_and_start_setup(num):
-        global num_players_selected, current_state, active_input_player_index, input_text
-        num_players_selected = num
-        active_input_player_index = 0
-        input_text = ""
-        current_state = STATE_PLAYER_SETUP
+    water = "≈"; lane_sep = "─" * pool_chars
+    for p in players:
+        y = p.lane_y
+        line = " "*left + (water * pool_chars)
+        screen.draw_line(y, line)
+        screen.draw_line(y-1, " "*left + lane_sep)
+        screen.draw_line(y+1, " "*left + lane_sep)
+        col = left + int(p.pos * meters_to_cols)
+        swimmer = "🏊" + " "
+        pre = (" "*left) + (water * max(0, min(pool_chars, col - left)))
+        post_len = max(0, right - len(pre) - len(swimmer))
+        post = (water * post_len)
+        swimline = pre + swimmer + post
+        screen.draw_line(y, swimline[:W])
 
-    if create_button("2 Players", (SCREEN_WIDTH // 2 - 100, button_y_start, 200, button_height), BUTTON_COLOR,
-                     BUTTON_HOVER_COLOR, DEFAULT_FONT, lambda: set_players_and_start_setup(2)): return
-    if create_button("3 Players",
-                     (SCREEN_WIDTH // 2 - 100, button_y_start + button_height + button_spacing, 200, button_height),
-                     BUTTON_COLOR, BUTTON_HOVER_COLOR, DEFAULT_FONT, lambda: set_players_and_start_setup(3)): return
-    if create_button("4 Players", (SCREEN_WIDTH // 2 - 100, button_y_start + 2 * (button_height + button_spacing), 200,
-                                   button_height), BUTTON_COLOR, BUTTON_HOVER_COLOR, DEFAULT_FONT,
-                     lambda: set_players_and_start_setup(4)): return
+    # Side-by-side HUD
+    top_hud_y = max(p.lane_y for p in players) + 2
+    col_split = max(W//2, 50)
 
-    if create_button("Back", (SCREEN_WIDTH // 2 - 100, button_y_start + 3 * (button_height + button_spacing) + 20, 200,
-                              button_height), GRAY, BUTTON_HOVER_COLOR, DEFAULT_FONT, lambda: STATE_MAIN_MENU):
-        current_state = STATE_MAIN_MENU
+    if len(players)>=1:
+        p=players[0]
+        Overlay.put(screen, top_hud_y, 1, f"🧑 {p.name}  {'🏁' if p.finished else '✓'}")
+        ms=[bar("O₂",p.o2,HUD_BAR_WIDTH,"🫁"), bar("Stamina",p.sta,HUD_BAR_WIDTH,"💪"), speed_bar(p.v,4.0,HUD_BAR_WIDTH,"🏁"), "💡 "+coaching(p, now)]
+        for i,m in enumerate(ms): Overlay.put(screen, top_hud_y+1+i, 1, m)
 
+    if len(players)>=2:
+        p=players[1]; start_x = min(W-2, col_split)
+        Overlay.put(screen, top_hud_y, start_x, f"🧑‍🤝‍🧑 {p.name}  {'🏁' if p.finished else '✓'}")
+        ms=[bar("O₂",p.o2,HUD_BAR_WIDTH,"🫁"), bar("Stamina",p.sta,HUD_BAR_WIDTH,"💪"), speed_bar(p.v,4.0,HUD_BAR_WIDTH,"🏁"), "💡 "+coaching(p, now)]
+        for i,m in enumerate(ms): Overlay.put(screen, top_hud_y+1+i, start_x, m)
 
-def player_setup_screen():
-    global current_state, players_data, active_input_player_index, input_text, num_players_selected
-    screen.fill(LIGHT_BLUE)
+    screen.draw_line(H-1, "Controls: P1[A/D]=stroke [S]=kick [W]=breathe | P2[J/L] [K] [I] | [Q]=quit  —  Anti-mash ON")
 
-    if active_input_player_index >= num_players_selected:
-        # All players named, initialize Player objects
-        players_data = []  # Clear previous player data if any
-        for i in range(num_players_selected):
-            # This assumes names were stored somewhere, or we use default names if input_text was per player
-            # For simplicity, let's assume input_text holds the last entered name, and we need a list of names.
-            # This part needs refinement if we want individual name entry.
-            # For now, let's just use default names from PLAYER_CONTROLS_CONFIG
-            player_name = temp_player_names[i] if i < len(temp_player_names) else PLAYER_CONTROLS_CONFIG[i]['name']
-            controls = PLAYER_CONTROLS_CONFIG[i]
-            players_data.append(Player(player_id=i, name=player_name, controls=controls, color=controls['color']))
-        print(f"Players created: {[p.name for p in players_data]}")
-        current_state = STATE_MAIN_MENU  # Or go to shop, or directly to race
-        return
+# ---------- Game loop ----------
 
-    draw_text(f"Enter Name for {PLAYER_CONTROLS_CONFIG[active_input_player_index]['name']}", DEFAULT_FONT, BLACK,
-              screen, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 3, center=True)
+def game(mode_two_players: bool):
+    try: cols, rows = os.get_terminal_size()
+    except OSError: cols, rows = 120, 30
+    rows = max(rows, 30); cols = max(cols, 96)
+    screen = Screen(cols, rows)
 
-    # Simple text input box
-    input_box_rect = pygame.Rect(SCREEN_WIDTH // 2 - 150, SCREEN_HEIGHT // 2 - 25, 300, 50)
-    pygame.draw.rect(screen, WHITE, input_box_rect)
-    pygame.draw.rect(screen, BLACK, input_box_rect, 2)  # Border
-    draw_text(input_text, DEFAULT_FONT, BLACK, screen, input_box_rect.x + 10, input_box_rect.y + 10)
+    reader = KeyReader(); it = InputThread(reader)
 
-    # "Next" or "Done" button
-    button_text = "Next Player" if active_input_player_index < num_players_selected - 1 else "Done"
+    p1 = Player("Player 1", keys={"left":"a","right":"d","kick":"s","breathe":"w"}, lane_y=6)
+    players=[p1]
+    if mode_two_players:
+        p2 = Player("Player 2", keys={"left":"j","right":"l","kick":"k","breathe":"i"}, lane_y=12)
+        players.append(p2)
 
-    def process_name_input():
-        global active_input_player_index, input_text, temp_player_names
-        if 'temp_player_names' not in globals():  # Initialize if not exists
-            globals()['temp_player_names'] = []
+    sys.stdout.write(HIDE+CLS+HOME); sys.stdout.flush()
+    t0 = time.perf_counter(); last=t0; dt_cap=1/60.0; running=True
 
-        if input_text.strip():  # Ensure name is not empty
-            temp_player_names.append(input_text.strip())
-            input_text = ""  # Reset for next player
-            active_input_player_index += 1
-        else:
-            # Show error: name cannot be empty
-            print("Name cannot be empty.")
+    try:
+        while running:
+            now=time.perf_counter(); dt=now-last
+            if dt < dt_cap:
+                time.sleep(dt_cap-dt); now=time.perf_counter(); dt=now-last
+            last=now
 
-    if create_button(button_text, (SCREEN_WIDTH // 2 - 75, SCREEN_HEIGHT * 2 // 3, 150, 50), BUTTON_COLOR,
-                     BUTTON_HOVER_COLOR, DEFAULT_FONT, process_name_input):
-        pass  # Action handled by process_name_input
+            # Time limit
+            if (now - t0) >= MAX_RACE_TIME:
+                for p in players:
+                    if not p.finished:
+                        p.finished=True; p.finish_time = now - t0
+                running=False
 
-    if create_button("Back to Menu", (20, SCREEN_HEIGHT - 60, 200, 40), GRAY, BUTTON_HOVER_COLOR, SMALL_FONT,
-                     lambda: STATE_MAIN_MENU):
-        current_state = STATE_MAIN_MENU
-        # Reset player setup progress
-        active_input_player_index = 0
-        input_text = ""
-        if 'temp_player_names' in globals(): del globals()['temp_player_names']
+            for ch in it.pop_all():
+                if ch=='q': running=False; break
+                for p in players: p.handle_key(ch, now)
 
+            for p in players:
+                if not p.finished:
+                    p.update(dt)
+                    if p.pos >= p.pool_len:
+                        p.finished=True; p.finish_time = now - t0
 
-def shop_screen():
-    global current_state, shop_current_player_idx
-    screen.fill(LIGHT_BLUE)
+            if all(p.finished for p in players): running=False
 
-    if not players_data:
-        draw_text("No players configured. Go to Main Menu.", DEFAULT_FONT, RED, screen, SCREEN_WIDTH // 2,
-                  SCREEN_HEIGHT // 2, center=True)
-        if create_button("Main Menu", (SCREEN_WIDTH // 2 - 100, SCREEN_HEIGHT * 3 // 4, 200, 50), BUTTON_COLOR,
-                         BUTTON_HOVER_COLOR, DEFAULT_FONT, lambda: STATE_MAIN_MENU):
-            current_state = STATE_MAIN_MENU
-        return
+            header = f"🏊 Swimming Simulator — {'2P' if mode_two_players else '1P'}  Time: {now-t0:5.2f}/{MAX_RACE_TIME:.0f}s  (Anti-mash, Glide)"
+            render_pool(screen, players, t0, header, now)
+            screen.flush()
 
-    player = players_data[shop_current_player_idx]
-    draw_text(f"Shop - {player.name}", LARGE_FONT, BLACK, screen, SCREEN_WIDTH // 2, 50, center=True)
-    draw_text(f"Coins: {player.coins}", DEFAULT_FONT, BLACK, screen, SCREEN_WIDTH - 150, 20)
+        # Summary
+        y = max(p.lane_y for p in players) + 12
+        lines=[""]
+        for p in players:
+            ttxt = f"{p.finish_time:0.2f}s" if p.finish_time is not None else "—"
+            lines.append(f"{p.name}: time={ttxt} strokes={p.stroke_count} avg_speed={p.pos/max(p.finish_time or 1e-6,1e-6):.2f} m/s pos={p.pos:.1f}m")
+        lines.append("Press any key to exit…")
+        for i,ln in enumerate(lines):
+            if y+i < screen.h-1: screen.draw_line(y+i, ln)
+        screen.flush()
+        while True:
+            ch=reader.getch()
+            if ch: break
+            time.sleep(0.02)
+    finally:
+        it.stop(); reader.cleanup(); sys.stdout.write(SHOW+"\n"); sys.stdout.flush()
 
-    item_y_start = 120
-    item_height = 30
-    item_spacing = 5
-    item_x_start = 50
-    item_width = SCREEN_WIDTH - 100
+# ---------- Menu / entry ----------
 
-    # Display items
-    idx = 0
-    for item_id, item_details in SHOP_ITEMS.items():
-        item_rect = pygame.Rect(item_x_start, item_y_start + idx * (item_height + item_spacing), item_width,
-                                item_height)
+def main():
+    mode_two=False
+    if len(sys.argv)>=2 and sys.argv[1] in ("2","--two","--2p"): mode_two=True
+    elif len(sys.argv)<2:
+        try:
+            print("Swimming Simulator (Terminal Prototype)")
+            print("1) One Player  [A/D stroke, S kick, W breathe]")
+            print("2) Two Players [P2 uses J/L stroke, K kick, I breathe]")
+            print("Q) Quit")
+            sel=input("Select [1/2]: ").strip().lower()
+            if sel=="2": mode_two=True
+            elif sel=="q": return
+        except (EOFError,KeyboardInterrupt): return
+    game(mode_two)
 
-        # Highlight owned items or current selection
-        display_color = GRAY if player.gear.get(item_details["type"]) == item_id or (
-                    item_details["type"] == "swimsuit" and player.gear.get("swimsuit") == item_id) else BUTTON_COLOR
-
-        # Check if item is affordable
-        affordable = player.coins >= item_details["price"]
-        button_text_color = TEXT_COLOR if affordable else RED
-
-        # Create a button for each item
-        mouse_pos = pygame.mouse.get_pos()
-        clicked = pygame.mouse.get_pressed()[0] == 1
-
-        final_button_color = display_color
-        if item_rect.collidepoint(mouse_pos):
-            final_button_color = BUTTON_HOVER_COLOR if affordable else (255, 100,
-                                                                        100)  # Different hover if not affordable
-            if clicked and affordable:
-                pygame.time.wait(200)  # debounce
-                player.buy_item(item_id)
-                # No return here, allow multiple buys per screen visit
-
-        pygame.draw.rect(screen, final_button_color, item_rect, border_radius=5)
-        draw_text(f"{item_details['name']} - ${item_details['price']} (Effect: {item_details['effect_value']})",
-                  SMALL_FONT, button_text_color, screen, item_rect.x + 10, item_rect.y + 5)
-        idx += 1
-        if item_y_start + idx * (item_height + item_spacing) > SCREEN_HEIGHT - 150:  # crude pagination
-            draw_text("More items below (scrolling not implemented)", SMALL_FONT, BLACK, screen, item_x_start,
-                      item_y_start + idx * (item_height + item_spacing))
-            break
-
-    # Navigation for shop
-    if create_button("Next Player", (SCREEN_WIDTH - 200, SCREEN_HEIGHT - 60, 180, 40), BUTTON_COLOR, BUTTON_HOVER_COLOR,
-                     SMALL_FONT,
-                     lambda: (shop_current_player_idx + 1) % len(players_data) if players_data else 0):
-        if players_data:
-            shop_current_player_idx = (shop_current_player_idx + 1) % len(players_data)
-
-    if create_button("Main Menu", (20, SCREEN_HEIGHT - 60, 180, 40), BUTTON_COLOR, BUTTON_HOVER_COLOR, SMALL_FONT,
-                     lambda: STATE_MAIN_MENU):
-        current_state = STATE_MAIN_MENU
-
-
-def race_screen_init():
-    """Initialize or reset players for the race."""
-    global race_winner
-    race_winner = None
-    for i, player in enumerate(players_data):
-        player.x = START_X
-        player.y = (i * (LANE_HEIGHT + LANE_PADDING)) + LANE_PADDING + LANE_HEIGHT // 2
-        player.finished_race = False
-        player.finish_time = 0
-        player.update_speed()  # Apply gear effects to speed
-        # player.use_snack() # Snacks are typically used during the race by player action, or automatically at start
-        # For simplicity, let's assume snacks are activated by the 'move' key for now if available
-    print("Race initialized. Players reset.")
-
-
-def race_screen():
-    global current_state, race_winner
-    screen.fill(BLUE)  # Water color
-
-    # Draw lanes
-    for i in range(num_players_selected):
-        lane_y_start = i * (LANE_HEIGHT + LANE_PADDING) + LANE_PADDING
-        pygame.draw.rect(screen, LIGHT_BLUE, (0, lane_y_start, SCREEN_WIDTH, LANE_HEIGHT))
-        # Draw lane lines (buoys) - simplified
-        for j in range(START_X, FINISH_LINE_X, 50):
-            pygame.draw.circle(screen, YELLOW, (j, lane_y_start), 5)
-            pygame.draw.circle(screen, YELLOW, (j, lane_y_start + LANE_HEIGHT), 5)
-
-    # Draw Finish Line
-    pygame.draw.line(screen, RED, (FINISH_LINE_X, 0), (FINISH_LINE_X, SCREEN_HEIGHT), 5)
-
-    # Update and draw players
-    all_finished = True
-    for i, player in enumerate(players_data):
-        lane_y_start = i * (LANE_HEIGHT + LANE_PADDING) + LANE_PADDING
-        player.draw(screen, lane_y_start)
-        player.update_speed()  # Keep updating speed for snack countdowns etc.
-        if not player.finished_race:
-            all_finished = False
-
-    # Check for winner
-    if not race_winner:
-        finished_players = [p for p in players_data if p.finished_race]
-        if finished_players:
-            # Sort by finish time (lower is better)
-            finished_players.sort(key=lambda p: p.finish_time)
-            if not race_winner:  # First one to finish
-                race_winner = finished_players[0]
-                print(f"Race winner: {race_winner.name}")
-                race_winner.coins += 10  # Award coins
-                print(f"{race_winner.name} awarded 10 coins. Total: {race_winner.coins}")
-
-    if all_finished or (
-            race_winner and pygame.time.get_ticks() > race_winner.finish_time + 3000):  # All finished or 3s after winner
-        current_state = STATE_RACE_END
-        return
-
-    # Back to menu button during race (optional)
-    if create_button("End Race Early", (SCREEN_WIDTH - 220, SCREEN_HEIGHT - 60, 200, 40), GRAY, BUTTON_HOVER_COLOR,
-                     SMALL_FONT, lambda: STATE_MAIN_MENU):
-        current_state = STATE_MAIN_MENU  # Or STATE_RACE_END
-        # Reset player positions if going back to menu without finishing
-        race_screen_init()
-
-
-def race_end_screen():
-    global current_state
-    screen.fill(LIGHT_BLUE)
-    if race_winner:
-        draw_text(f"{race_winner.name} Wins!", LARGE_FONT, GREEN, screen, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 3,
-                  center=True)
-        draw_text(f"Awarded 10 coins.", DEFAULT_FONT, BLACK, screen, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2, center=True)
-    else:
-        draw_text("Race Over!", LARGE_FONT, BLACK, screen, SCREEN_WIDTH // 2, SCREEN_HEIGHT // 3, center=True)
-        draw_text("No winner declared (or race ended early).", DEFAULT_FONT, BLACK, screen, SCREEN_WIDTH // 2,
-                  SCREEN_HEIGHT // 2, center=True)
-
-    # Display all player times/positions (optional)
-    y_offset = SCREEN_HEIGHT // 2 + 60
-    sorted_players = sorted(players_data,
-                            key=lambda p: (not p.finished_race, p.finish_time if p.finished_race else float('inf')))
-    for i, p in enumerate(sorted_players):
-        time_text = f"{(p.finish_time - (pygame.time.get_ticks() - 3000)) / 1000 :.2f}s" if p.finished_race and race_winner else (
-            "Finished" if p.finished_race else "DNF")
-        # The time calculation above is a bit off, should be simpler: (p.finish_time - race_start_time) / 1000
-        # For now, just display name and if finished
-        status = "Finished" if p.finished_race else "Did not finish"
-        draw_text(f"{i + 1}. {p.name}: {status}", SMALL_FONT, BLACK, screen, SCREEN_WIDTH // 2, y_offset + i * 25,
-                  center=True)
-
-    if create_button("Main Menu", (SCREEN_WIDTH // 2 - 100, SCREEN_HEIGHT * 3 // 4, 200, 50), BUTTON_COLOR,
-                     BUTTON_HOVER_COLOR, DEFAULT_FONT, lambda: STATE_MAIN_MENU):
-        current_state = STATE_MAIN_MENU
-        race_screen_init()  # Reset for next potential race
-
-
-# --- Main Game Loop ---
-running = True
-is_race_initialized = False  # Flag to initialize race screen once
-
-while running:
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-
-        if current_state == STATE_PLAYER_SETUP:
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_RETURN:
-                    # This logic is now handled by the "Next/Done" button's action
-                    pass
-                elif event.key == pygame.K_BACKSPACE:
-                    input_text = input_text[:-1]
-                else:
-                    if len(input_text) < 20:  # Max name length
-                        input_text += event.unicode
-
-        if current_state == STATE_RACE:
-            if event.type == pygame.KEYDOWN:
-                for player in players_data:
-                    if not player.finished_race:
-                        if event.key == player.controls['move']:
-                            player.move()
-                            # Activate snack if player has one and presses move key
-                            if player.gear["snack"] and player.snack_active_time <= 0:
-                                player.use_snack()
-                        elif event.key == player.controls['exit']:
-                            # This key is for finishing, which is now handled by reaching FINISH_LINE_X
-                            # Could be repurposed for something else, or just signifies the intent to finish
-                            # For now, let's make it an explicit action to cross the line if very close
-                            if player.x >= FINISH_LINE_X - player.current_speed * 2:  # If within 2 moves of finish
-                                player.x = FINISH_LINE_X
-                                player.finished_race = True
-                                player.finish_time = pygame.time.get_ticks()
-                                print(f"{player.name} used exit key to finish.")
-
-    # State Management & Drawing
-    if current_state == STATE_MAIN_MENU:
-        main_menu()
-    elif current_state == STATE_PLAYER_SELECT:
-        player_select_screen()
-    elif current_state == STATE_PLAYER_SETUP:
-        player_setup_screen()
-    elif current_state == STATE_SHOP:
-        shop_screen()
-    elif current_state == STATE_RACE:
-        if not is_race_initialized:
-            race_screen_init()
-            is_race_initialized = True
-        race_screen()
-    elif current_state == STATE_RACE_END:
-        is_race_initialized = False  # Reset for next race
-        race_end_screen()
-
-    pygame.display.flip()
-    clock.tick(FPS)
-
-pygame.quit()
-sys.exit()
+if __name__ == "__main__":
+    if os.name=="nt":
+        try:
+            import ctypes
+            k=ctypes.windll.kernel32; h=k.GetStdHandle(-11); mode=ctypes.c_uint32()
+            if k.GetConsoleMode(h, ctypes.byref(mode)):
+                k.SetConsoleMode(h, mode.value | 0x0004)
+        except Exception: pass
+    main()
