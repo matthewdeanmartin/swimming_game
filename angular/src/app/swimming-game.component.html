@@ -1,0 +1,22 @@
+<div class="game-container">
+  <h1>Swimming Simulator SPA</h1>
+
+  <div class="canvas-wrapper">
+    <canvas #gameCanvas></canvas>
+
+    <div class="hud-instructions">
+      {{ instructions }}
+    </div>
+
+    <div class="modal" *ngIf="gameState !== 'playing'" [ngClass]="gameState">
+      <h2>
+        {{ gameState === 'winner' ? winnerName + ' WINS!' : 'EVERYONE DROWNED' }}
+      </h2>
+      <p>Press <strong>SPACE</strong> to Restart</p>
+    </div>
+  </div>
+
+  <p class="footer-note">
+    Don't forget the 17 second rule! Breathe before the bar runs out.
+  </p>
+</div>

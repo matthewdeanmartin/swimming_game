@@ -1,0 +1,38 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout 🛎️
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ⚙️
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Initialize (Install Deps) 📦
+        run: make init
+
+      - name: Build for GitHub Pages 🏗️
+        # We extract the repository name automatically (e.g., "user/repo" -> "repo")
+        run: |
+          REPO_NAME=${GITHUB_REPOSITORY#*/}
+          make build-gh REPO_NAME=$REPO_NAME
+
+      - name: Deploy 🚀
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: dist/swimming-game/browser # Update 'swimming-game' if your package.json name differs
+          branch: gh-pages
