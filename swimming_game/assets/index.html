@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Swimming Simulator - 17s Challenge</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/phaser/3.60.0/phaser.min.js"></script>
+    <style>
+        body { margin: 0; background-color: #333; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; font-family: sans-serif; }
+        canvas { box-shadow: 0 0 20px rgba(0,0,0,0.5); border: 2px solid #555; }
+    </style>
+</head>
+<body>
+
+<script>
+const CONFIG = {
+    width: 1000,
+    height: 600,
+    poolLength: 800, // Meters * Pixels scaling
+    maxBreath: 17,
+    fastCadence: 250, // ms
+    finishLineX: 40 * 20, // POOL_LENGTH_METERS * PIXELS_PER_METER
+};
+
+class MainScene extends Phaser.Scene {
+    constructor() {
+        super('MainScene');
+    }
+
+    preload() {
+        // Load your daughter's assets
+        this.load.image('pool', 'pool.png');
+        this.load.image('swimmer_red', 'swimmer red.png');
+        this.load.image('swimmer_blue', 'swimmer blue.png');
+        this.load.image('drown_red', 'drowning red.png');
+        this.load.image('drown_blue', 'drowning blue.png');
+    }
+
+    create() {
+        // Background and World
+        this.add.tileSprite(0, 0, CONFIG.finishLineX + 2000, 600, 'pool').setOrigin(0, 0);
+        // this.add.tileSprite(0, 0, CONFIG.finishLineX + 1000, 600, 'pool').setOrigin(0, 0);
+
+        // Setup Players
+        this.p1 = this.createPlayer('Red', 150, 'red', {
+            up: 'W', left: 'A', down: 'S', right: 'D'
+        });
+        this.p2 = this.createPlayer('Blue', 350, 'blue', {
+            up: 'I', left: 'J', down: 'K', right: 'L'
+        });
+
+        this.players = [this.p1, this.p2];
+        this.winner = null;
+        this.gameOver = false;
+
+        // Visual Finish Line
+        this.createFinishLine();
+
+        // HUD Text
+        this.instructionText = this.add.text(20, 10,
+            "P1: [W] Breathe, [A/D] Stroke, [S] Kick | P2: [I] Breathe, [J/L] Stroke, [K] Kick",
+            { fontSize: '16px', fill: '#fff', backgroundColor: '#000000aa', padding: 5 });
+        this.instructionText.setScrollFactor(0);
+    }
+
+    createPlayer(name, y, color, keys) {
+        const player = this.add.container(20, y);
+
+        // Sprites
+        const sprite = this.add.sprite(0, 0, `swimmer_${color}`).setOrigin(0, 0);
+        const drownSprite = this.add.sprite(0, 0, `drown_${color}`).setOrigin(0, 0).setVisible(false);
+
+        // Bars
+        const breathBar = this.add.graphics();
+        const staminaBar = this.add.graphics();
+
+        player.add([sprite, drownSprite, breathBar, staminaBar]);
+
+        // Logic data
+        player.data = {
+            name: name,
+            color: color,
+            sprite: sprite,
+            drownSprite: drownSprite,
+            breathBar: breathBar,
+            staminaBar: staminaBar,
+            keys: this.input.keyboard.addKeys(keys),
+            posX: 20,
+            velocity: 0,
+            stamina: 1.0,
+            fatigue: 0,
+            breathTimer: CONFIG.maxBreath,
+            lastStrokeTime: 0,
+            lastStrokeSide: null,
+            penaltyTimer: 0,
+            drowned: false,
+            finished: false,
+            sinkOffset: 0
+        };
+
+        return player;
+    }
+
+    createFinishLine() {
+        const x = CONFIG.finishLineX;
+        const graphics = this.add.graphics();
+        graphics.fillStyle(0x000000, 1);
+        graphics.fillRect(x, 0, 40, 600);
+
+        // Checkered pattern
+        graphics.fillStyle(0xffffff, 1);
+        for (let y = 0; y < 600; y += 40) {
+            graphics.fillRect(x, y, 20, 20);
+            graphics.fillRect(x + 20, y + 20, 20, 20);
+        }
+        this.add.text(x - 80, 50, "FINISH", { fontSize: '32px', fontStyle: 'bold' });
+    }
+
+    update(time, delta) {
+        const dt = delta / 1000;
+        let leaderX = 0;
+
+        this.players.forEach(p => {
+            this.handlePlayerLogic(p, time, dt);
+            this.drawPlayerHUD(p);
+            if (p.data.posX > leaderX) leaderX = p.data.posX;
+        });
+
+        // Camera Follow
+        const targetCamX = Math.max(0, Math.min(leaderX - 200, CONFIG.finishLineX - 800));
+        this.cameras.main.scrollX += (targetCamX - this.cameras.main.scrollX) * 0.1;
+
+        this.checkEndState();
+    }
+
+    handlePlayerLogic(p, time, dt) {
+        const d = p.data;
+        if (d.finished) return;
+
+        if (d.drowned) {
+            d.velocity = 0;
+            d.sinkOffset += 20 * dt;
+            d.sprite.setVisible(false);
+            d.drownSprite.setVisible(true);
+            // Sinking crop effect
+            const visibleHeight = Math.max(0, d.drownSprite.height - d.sinkOffset);
+            d.drownSprite.setCrop(0, 0, d.drownSprite.width, visibleHeight);
+            d.drownSprite.y = d.sinkOffset;
+            return;
+        }
+
+        // 1. Breath Logic
+        d.breathTimer -= dt;
+        if (d.breathTimer <= 0) d.drowned = true;
+
+        // 2. Input
+        if (Phaser.Input.Keyboard.JustDown(d.keys.left)) this.stroke(p, 'L', time);
+        if (Phaser.Input.Keyboard.JustDown(d.keys.right)) this.stroke(p, 'R', time);
+        if (Phaser.Input.Keyboard.JustDown(d.keys.up)) {
+            d.breathTimer = CONFIG.maxBreath;
+            d.velocity *= 0.8;
+            d.stamina = Math.min(1, d.stamina + 0.1);
+        }
+        if (Phaser.Input.Keyboard.JustDown(d.keys.down)) {
+            d.velocity += 15 * d.stamina;
+            d.stamina = Math.max(0, d.stamina - 0.05);
+        }
+
+        // 3. Physics & Recovery
+        d.stamina = Math.min(1, d.stamina + dt * 0.05);
+        d.fatigue = Math.max(0, d.fatigue - dt * 0.02);
+        if (d.penaltyTimer > 0) d.penaltyTimer -= dt;
+
+        let dragFactor = d.breathTimer < 5 ? 3.0 : 2.0;
+        d.velocity -= d.velocity * dragFactor * dt;
+        if (d.velocity < 0) d.velocity = 0;
+
+        d.posX += d.velocity * dt;
+        p.x = d.posX;
+
+        // 4. Finish Check
+        if (d.posX >= CONFIG.finishLineX) {
+            d.posX = CONFIG.finishLineX;
+            d.finished = true;
+            if (!this.winner) this.winner = d.name;
+        }
+    }
+
+    stroke(p, side, time) {
+        const d = p.data;
+        const diff = time - d.lastStrokeTime;
+
+        if (diff < CONFIG.fastCadence) {
+            d.velocity -= 50;
+            d.penaltyTimer = 0.5;
+            d.fatigue = Math.min(1, d.fatigue + 0.05);
+        } else {
+            let altBonus = d.lastStrokeSide !== side ? 1.0 : 0.6;
+            let thrust = 80 * altBonus * (0.5 + 0.5 * d.stamina) * (1.0 - 0.5 * d.fatigue);
+            d.velocity += thrust;
+        }
+
+        d.lastStrokeTime = time;
+        d.lastStrokeSide = side;
+        d.stamina = Math.max(0, d.stamina - 0.03);
+    }
+
+    drawPlayerHUD(p) {
+        const d = p.data;
+        d.breathBar.clear();
+        d.staminaBar.clear();
+        if (d.drowned || d.finished) return;
+
+        // Breath Bar
+        d.breathBar.fillStyle(0x330000);
+        d.breathBar.fillRect(0, -20, 60, 6);
+        const bCol = d.breathTimer < 5 ? 0xff3333 : 0x66ffff;
+        d.breathBar.fillStyle(bCol);
+        d.breathBar.fillRect(0, -20, 60 * (d.breathTimer / CONFIG.maxBreath), 6);
+
+        // Stamina Bar
+        d.staminaBar.fillStyle(0x222200);
+        d.staminaBar.fillRect(0, -12, 60, 3);
+        d.staminaBar.fillStyle(0xffff00);
+        d.staminaBar.fillRect(0, -12, 60 * d.stamina, 3);
+
+        // if (d.penaltyTimer > 0) {
+        //     this.add.text(d.posX + 70, p.y - 25, "TOO FAST!", {fontSize: '12px', fill: '#f00'}).setDuration(100);
+        // }
+        if (d.penaltyTimer > 0) {
+            // Create the warning text
+            const warning = this.add.text(d.posX + 70, p.y - 25, "TOO FAST!", {
+                fontSize: '12px',
+                fill: '#f00',
+                fontStyle: 'bold'
+            });
+
+            // Use a tween to fade it out and then destroy it
+            this.tweens.add({
+                targets: warning,
+                alpha: 0,
+                duration: 500, // Stay visible for half a second
+                onComplete: () => warning.destroy()
+            });
+
+            // Reset timer so it doesn't spawn 60 warnings per second
+            d.penaltyTimer = 0;
+        }
+    }
+
+    checkEndState() {
+        if (this.gameOver) return;
+
+        let msg = "";
+        if (this.winner) msg = `${this.winner} WINS! Press SPACE to Restart`;
+        else if (this.players.every(p => p.data.drowned)) msg = "EVERYONE DROWNED. Press SPACE to Restart";
+
+        if (msg) {
+            this.gameOver = true;
+            const t = this.add.text(this.cameras.main.midPoint.x, 300, msg, {
+                fontSize: '40px', fontStyle: 'bold', fill: '#0f0', backgroundColor: '#000', padding: 20
+            }).setOrigin(0.5);
+
+            this.input.keyboard.once('keydown-SPACE', () => {
+                this.scene.restart();
+            });
+        }
+    }
+}
+
+const game = new Phaser.Game({
+    type: Phaser.AUTO,
+    width: CONFIG.width,
+    height: CONFIG.height,
+    scene: MainScene,
+    physics: { default: 'arcade' }
+});
+</script>
+
+</body>
+</html>
