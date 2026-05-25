@@ -30,3 +30,6 @@ include = [
     "swimming_game/py.typed",
     "/README.md", "LICENSE",
 ]
+
+[tool.uv]
+universal = true
